@@ -350,12 +350,12 @@ async function serve(client: ClientWire, body: Json, res: ServerResponse): Promi
   const requestedModel = typeof body.model === 'string' && body.model !== '' ? body.model : '';
   const format = isRecord(body.response_format) ? body.response_format.type : undefined;
   const jsonOnOpenAIClient = client === 'openai' && (format === 'json_object' || format === 'json_schema');
-  const triedProviders = new Set<string>();
+  const triedModels = new Set<string>();
   for (;;) {
-    const candidates = candidatesFor(arriving.requires, arriving.weight, jsonOnOpenAIClient).filter((c) => !triedProviders.has(c.probe.provider.id));
+    const candidates = candidatesFor(arriving.requires, arriving.weight, jsonOnOpenAIClient).filter((c) => !triedModels.has(c.probe.provider.id + '/' + c.model.id));
     if (candidates.length === 0) break;
     const candidate = candidates[0];
-    triedProviders.add(candidate.probe.provider.id);
+    triedModels.add(candidate.probe.provider.id + '/' + candidate.model.id);
     const state = stateOf(candidate.probe.provider.id);
     state.calls += 1;
     const served = await attempt(candidate, client, body, stream, requestedModel !== '' ? requestedModel : candidate.model.id, res);
