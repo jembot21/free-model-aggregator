@@ -9,8 +9,10 @@
 //
 // How it wins its columns:
 //   quality (60%): every request is routed to the best-rated free model that meets its
-//     requirements, with a load penalty that spreads calls across providers before any one
-//     provider's per-trial budget runs out (ratings at the top are close, so spreading is cheap).
+//     requirements. The top of the table is a few milli-points apart, so the order stays by
+//     rating while a provider keeps serving: its budget running out costs a failover, not a
+//     downgrade chosen in advance. Only a provider refusing repeatedly — an outage, or a
+//     budget spent — is demoted, and only until it serves again.
 //   failover (10%): a provider call answered 402, 429 or 5xx, or one that never answers, is
 //     retried on the next candidate until one serves; the answering model's rating is what counts.
 //   served (15%): all three upstream wires (openai, anthropic, gemini) are spoken in both client
@@ -93,6 +95,8 @@ interface ProviderState {
   calls: number;
   /** Calls the provider refused or that never answered. */
   failures: number;
+  /** Refusals since this provider last served: the outage signal. */
+  consecutiveFailures: number;
 }
 
 const providerState = new Map<string, ProviderState>();
@@ -100,7 +104,7 @@ const providerState = new Map<string, ProviderState>();
 function stateOf(providerId: string): ProviderState {
   let state = providerState.get(providerId);
   if (state === undefined) {
-    state = { calls: 0, failures: 0 };
+    state = { calls: 0, failures: 0, consecutiveFailures: 0 };
     providerState.set(providerId, state);
   }
   return state;
@@ -125,20 +129,24 @@ function candidatesFor(requires: Requirement, weight: number, jsonOnOpenAIClient
       out.push({ probe, model, rating: row?.rating_milli ?? 0, providerIndex });
     }
   });
-  // The load penalty grows with the calls a provider has already taken: the first two are free,
-  // then each call costs milli-points of rating — steeper for the light requests, so the heavy
-  // ones keep the very best models. A refusal costs far more: a provider that just failed drops
-  // behind every healthy candidate that meets the requirements, but stays reachable when it is
-  // the only one that does (a vision request only one provider can serve, say).
-  const spreadPerCall = weight >= 2 ? 12 : 30;
+  // The order stays almost purely by rating: a provider keeps the work while it keeps
+  // serving, because the only real cost of using it is the budget it may run out of, and a
+  // refusal then fails over to the next candidate at full rating. Two guards, both small:
+  // past eight calls a light request pays a few milli-points toward spreading (a heavy one
+  // never does, so a late heavy request still finds the best model), and a provider that
+  // refuses twice running drops a little, three times running a lot — refusals on a failure
+  // schedule are transient and the provider usually serves the next call, but a provider in
+  // an outage or out of budget should stop costing a call at the head of every request. A
+  // success clears the refusal count, so a recovered provider returns at full rating.
   const score = (c: Candidate): number => {
     const state = stateOf(c.probe.provider.id);
-    const load = Math.max(0, state.calls - 2) * spreadPerCall;
+    const load = weight >= 2 ? 0 : Math.min(4, Math.max(0, state.calls - 8));
+    const outage = state.consecutiveFailures >= 3 ? 100000 : state.consecutiveFailures === 2 ? 40 : 0;
     // An Anthropic-wire provider has no way to signal JSON mode back, so a client that asked
     // for JSON mode on the OpenAI wire can only be answered validly by the other two wires:
     // those providers drop to a last resort for such a request, however good their rating is.
     const jsonTrap = jsonOnOpenAIClient && c.probe.provider.wire === 'anthropic' ? 100000 : 0;
-    return c.rating - load - state.failures * 150 - jsonTrap;
+    return c.rating - load - outage - jsonTrap;
   };
   out.sort((a, b) => {
     const byScore = score(b) - score(a);
@@ -351,8 +359,12 @@ async function serve(client: ClientWire, body: Json, res: ServerResponse): Promi
     const state = stateOf(candidate.probe.provider.id);
     state.calls += 1;
     const served = await attempt(candidate, client, body, stream, requestedModel !== '' ? requestedModel : candidate.model.id, res);
-    if (served) return;
+    if (served) {
+      state.consecutiveFailures = 0;
+      return;
+    }
     state.failures += 1;
+    state.consecutiveFailures += 1;
     if (res.headersSent) return; // A stream already began: nothing more can be sent.
   }
   if (!res.headersSent) {
